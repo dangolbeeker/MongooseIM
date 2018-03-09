@@ -34,6 +34,7 @@
 
 -include("mongoose.hrl").
 -include("scram.hrl").
+-include("jid.hrl").
 
 -type http_error_atom() :: conflict | not_found | not_authorized | not_allowed.
 
@@ -61,7 +62,17 @@ store_type(Server) ->
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
                                            | {error, any()}.
 authorize(Creds) ->
-    ejabberd_auth:authorize_with_check_password(?MODULE, Creds).
+    case mongoose_credentials:get(Creds, der_cert, undefined) of
+        undefined -> ejabberd_auth:authorize_with_check_password(?MODULE, Creds);
+        DerCert ->
+            {LServer, LUser} = get_server_and_user_name(Creds),
+            case verify_cert(LUser, LServer, DerCert) of
+                true -> {ok, mongoose_credentials:extend(Creds, [{username, LUser},
+                                                                 {auth_module, ?MODULE}])};
+                false -> {error, not_authorized}
+            end
+    end.
+
 
 -spec check_password(jid:luser(), jid:lserver(), binary()) -> boolean().
 check_password(LUser, LServer, Password) ->
@@ -256,6 +267,27 @@ verify_scram_password(LUser, LServer, Password) ->
         _ ->
             {error, not_exists}
     end.
+
+verify_cert(LUser, LServer, DerCert) ->
+    case make_req(get, <<"get_certs">>, LUser, LServer, <<"">>) of
+        {ok, PemCert} ->
+            UserCert = {'Certificate', DerCert, not_encrypted},
+            [] =/= [Cert || Cert <- public_key:pem_decode(PemCert), Cert =:= UserCert];
+        _ -> false
+    end.
+
+get_server_and_user_name(Creds) ->
+    AuthName = mongoose_credentials:get(Creds, requested_name, undefined),
+    [XmppAddr | _] = mongoose_credentials:get(Creds, xmpp_addressses, [undefined]),
+    CN = mongoose_credentials:get(Creds, common_name, undefined),
+    [JID | _] = [Name || Name <- [AuthName, XmppAddr, CN, <<"">>], Name =/= undefined],
+    LS = mongoose_credentials:lserver(Creds),
+    case jid:from_binary(JID) of
+        #jid{luser = LU, lserver = LS, lresource = <<"">>} when LU =/= <<"">> ->
+            {LS, LU};
+        _ -> {error, error}
+    end.
+
 
 stop(_Host) ->
     ok.

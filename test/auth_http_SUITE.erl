@@ -24,6 +24,7 @@
 -define(DOMAIN2, <<"localhost2">>).
 -define(AUTH_HOST, "http://localhost:12000").
 -define(BASIC_AUTH, "softkitty:purrpurrpurr").
+-define(CERT_PATH, "../../../../tools/ssl").
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -35,7 +36,7 @@ all() ->
 groups() ->
     [
      {auth_requests_plain, [sequence], all_tests()},
-     {auth_requests_scram, [sequence], all_tests()}
+     {auth_requests_scram, [sequence], [cert_auth | all_tests()]}
     ].
 
 all_tests() ->
@@ -103,6 +104,19 @@ init_per_testcase(remove_user, Config) ->
     mim_ct_rest:register(<<"toremove1">>, ?DOMAIN1, do_scram(<<"pass">>, Config)),
     mim_ct_rest:register(<<"toremove2">>, ?DOMAIN1, do_scram(<<"pass">>, Config)),
     Config;
+init_per_testcase(cert_auth, Config) ->
+    meck_config(Config),
+    try
+        {ok, Cert1} = file:read_file(?CERT_PATH ++ "/mongooseim/cert.pem"),
+        {ok, Cert2} = file:read_file(?CERT_PATH ++ "/ca/cacert.pem"),
+        SeveralCerts = <<Cert1/bitstring, Cert2/bitstring>>,
+        [_, {'Certificate', DerBin, not_encrypted} | _] = public_key:pem_decode(SeveralCerts),
+        mim_ct_rest:register(<<"cert_user">>, ?DOMAIN1, SeveralCerts),
+        [{der_cert, DerBin} | Config]
+    catch
+        _:E ->
+            {skip, {E, ?CERT_PATH, file:get_cwd()}}
+    end;
 init_per_testcase(_CaseName, Config) ->
     meck_config(Config),
     Config.
@@ -114,6 +128,10 @@ end_per_testcase(try_register, Config) ->
 end_per_testcase(remove_user, Config) ->
     mim_ct_rest:remove_user(<<"toremove1">>, ?DOMAIN1),
     mim_ct_rest:remove_user(<<"toremove2">>, ?DOMAIN1),
+    meck_cleanup(),
+    Config;
+end_per_testcase(cert_auth, Config) ->
+    mim_ct_rest:remove_user(<<"cert_user">>, ?DOMAIN1),
     meck_cleanup(),
     Config;
 end_per_testcase(_CaseName, Config) ->
@@ -171,11 +189,28 @@ remove_user(_Config) ->
 
     {error, not_exists} = ejabberd_auth_http:remove_user(<<"toremove3">>, ?DOMAIN1, <<"wrongpass">>).
 
+cert_auth(Config) ->
+    Cert = proplists:get_value(der_cert, Config),
+    NewCreds = mongoose_credentials:new(?DOMAIN1),
+    CredsWithCert = mongoose_credentials:set(NewCreds, der_cert, Cert),
+    JID = <<<<"cert_user">>/bitstring, <<"@">>/bitstring, ?DOMAIN1/bitstring>>,
+    {error, not_authorized} = ejabberd_auth_http:authorize(CredsWithCert),
+    [begin
+         Creds = mongoose_credentials:set(CredsWithCert, F, V),
+         {ok, AuthCreds} = ejabberd_auth_http:authorize(Creds),
+         <<"cert_user">> = mongoose_credentials:get(AuthCreds, username)
+     end || {F, V} <- [{requested_name, JID},
+                       {xmpp_addressses, [JID]},
+                       {common_name, JID}]].
+
+
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
 meck_config(Config) ->
+    meck:unload(),
     ScramOpts = case lists:keyfind(scram_group, 1, Config) of
                     {_, true} -> [{password_format, scram}];
                     _ -> []
